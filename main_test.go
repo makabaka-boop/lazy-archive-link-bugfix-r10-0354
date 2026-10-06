@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -186,6 +187,392 @@ func TestAllSupportedObjectAlignments(t *testing.T) {
 			t.Fatalf("chunk %d offset = 0x%x, want 0x%x", i, got, want)
 		}
 	}
+}
+
+func TestStaticArchiveSelectsNeededDependencyClosure(t *testing.T) {
+	in := inputFile{Items: []linkItem{
+		{Object: &inputObject{
+			Name:        "start",
+			Text:        ByteSlice{0, 0, 0, 0},
+			Relocations: []inputReloc{{Section: "text", Offset: 0, Type: "ABS32", Symbol: "main"}},
+		}},
+		{Archive: &inputArchive{
+			Name: "lib.a",
+			Members: []inputObject{
+				{
+					Name: "main.o",
+					Text: ByteSlice{0, 0, 0, 0},
+					Symbols: []inputSymbol{
+						{Name: "main", Binding: "strong", Section: "text", Value: 0},
+					},
+					Relocations: []inputReloc{{Section: "text", Offset: 0, Type: "ABS32", Symbol: "helper"}},
+				},
+				{
+					Name: "helper.o",
+					Text: ByteSlice{0, 0, 0, 0},
+					Symbols: []inputSymbol{
+						{Name: "helper", Binding: "strong", Section: "text", Value: 0},
+					},
+					Relocations: []inputReloc{{Section: "text", Offset: 0, Type: "ABS32", Symbol: "util"}},
+				},
+				{
+					Name: "util.o",
+					Text: ByteSlice{0, 0},
+					Symbols: []inputSymbol{
+						{Name: "util", Binding: "strong", Section: "text", Value: 0},
+					},
+					Relocations: []inputReloc{{Section: "text", Offset: 0, Type: "PCREL16", Symbol: "helper"}},
+				},
+				// This unused duplicate would produce two strong main
+				// definitions if archives were pulled in wholesale.
+				{
+					Name:    "unused-main-duplicate.o",
+					Text:    ByteSlice{0xff},
+					Symbols: []inputSymbol{{Name: "main", Binding: "strong", Section: "text", Value: 0}},
+				},
+			},
+		}},
+	}}
+
+	image, report, err := link(marshalInput(t, in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := hex.DecodeString("04100000081000000c100000faff")
+	if !bytes.Equal(image, want) {
+		t.Fatalf("image = %x, want %x", image, want)
+	}
+	wantLayout := []struct {
+		name   string
+		offset int
+		size   int
+	}{
+		{"start", 0, 4},
+		{"main.o", 4, 4},
+		{"helper.o", 8, 4},
+		{"util.o", 12, 2},
+	}
+	if len(report.Layout) != len(wantLayout) {
+		t.Fatalf("layout = %+v", report.Layout)
+	}
+	for i, want := range wantLayout {
+		got := report.Layout[i]
+		if got.ObjectName != want.name || int(got.ImageOffset) != want.offset || got.Size != want.size {
+			t.Fatalf("layout %d = %+v, want %+v", i, got, want)
+		}
+	}
+	wantExtracted := []extraction{
+		{Archive: "lib.a", Member: "main.o", Cause: "main"},
+		{Archive: "lib.a", Member: "helper.o", Cause: "helper"},
+		{Archive: "lib.a", Member: "util.o", Cause: "util"},
+	}
+	if got := report.Extracted; len(got) != len(wantExtracted) {
+		t.Fatalf("extracted = %+v, want %+v", got, wantExtracted)
+	} else {
+		for i := range wantExtracted {
+			if got[i] != wantExtracted[i] {
+				t.Fatalf("extraction %d = %+v, want %+v", i, got[i], wantExtracted[i])
+			}
+		}
+	}
+}
+
+func TestStaticArchiveRescanStartsAtFirstMember(t *testing.T) {
+	in := inputFile{Items: []linkItem{
+		{Object: &inputObject{
+			Name:        "start",
+			Text:        ByteSlice{0, 0, 0, 0},
+			Relocations: []inputReloc{{Section: "text", Offset: 0, Type: "ABS32", Symbol: "need"}},
+		}},
+		{Archive: &inputArchive{Name: "lib.a", Members: []inputObject{
+			{
+				Name: "early-provider.o",
+				Text: ByteSlice{0xaa},
+				Symbols: []inputSymbol{
+					{Name: "dep", Binding: "strong", Section: "text", Value: 0},
+				},
+			},
+			{
+				Name: "requester.o",
+				Text: ByteSlice{0, 0, 0, 0},
+				Symbols: []inputSymbol{
+					{Name: "need", Binding: "strong", Section: "text", Value: 0},
+				},
+				Relocations: []inputReloc{{Section: "text", Offset: 0, Type: "ABS32", Symbol: "dep"}},
+			},
+			// The second dep is ignored because the rescan starts at member
+			// zero and selects early-provider.o first.
+			{
+				Name:    "late-duplicate-dep.o",
+				Text:    ByteSlice{0xff},
+				Symbols: []inputSymbol{{Name: "dep", Binding: "strong", Section: "text", Value: 0}},
+			},
+		}}},
+	}}
+
+	image, report, err := link(marshalInput(t, in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, _ := hex.DecodeString("0410000008100000aa"); !bytes.Equal(image, want) {
+		t.Fatalf("image = %x, want %x", image, want)
+	}
+	wantLayout := []string{"start", "requester.o", "early-provider.o"}
+	if len(report.Layout) != len(wantLayout) {
+		t.Fatalf("layout = %+v", report.Layout)
+	}
+	for i, name := range wantLayout {
+		if report.Layout[i].ObjectName != name {
+			t.Fatalf("layout %d = %q, want %q (%+v)", i, report.Layout[i].ObjectName, name, report.Layout)
+		}
+	}
+	wantExtracted := []extraction{
+		{Archive: "lib.a", Member: "requester.o", Cause: "need"},
+		{Archive: "lib.a", Member: "early-provider.o", Cause: "dep"},
+	}
+	if len(report.Extracted) != len(wantExtracted) {
+		t.Fatalf("extracted = %+v, want %+v", report.Extracted, wantExtracted)
+	}
+	for i := range wantExtracted {
+		if report.Extracted[i] != wantExtracted[i] {
+			t.Fatalf("extraction %d = %+v, want %+v", i, report.Extracted[i], wantExtracted[i])
+		}
+	}
+}
+
+func TestStaticArchiveUsesFirstProviderAndWeakRules(t *testing.T) {
+	t.Run("first member providing symbol wins", func(t *testing.T) {
+		in := inputFile{Items: []linkItem{
+			{Object: &inputObject{
+				Name:        "start",
+				Text:        ByteSlice{0, 0, 0, 0},
+				Relocations: []inputReloc{{Section: "text", Offset: 0, Type: "ABS32", Symbol: "X"}},
+			}},
+			{Archive: &inputArchive{Name: "lib.a", Members: []inputObject{
+				{Name: "first.o", Text: ByteSlice{1}, Symbols: []inputSymbol{{Name: "X", Binding: "strong", Section: "text", Value: 0}}},
+				{Name: "second.o", Text: ByteSlice{2}, Symbols: []inputSymbol{{Name: "X", Binding: "strong", Section: "text", Value: 0}}},
+			}}},
+		}}
+		image, report, err := link(marshalInput(t, in))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := []byte{4, 0x10, 0, 0, 1}; !bytes.Equal(image, want) {
+			t.Fatalf("image = %x, want %x", image, want)
+		}
+		if len(report.Layout) != 2 || report.Layout[1].ObjectName != "first.o" {
+			t.Fatalf("layout = %+v", report.Layout)
+		}
+		if got := report.Extracted; len(got) != 1 || got[0].Member != "first.o" || got[0].Cause != "X" {
+			t.Fatalf("extraction evidence = %+v", got)
+		}
+	})
+
+	t.Run("previously selected weak definition blocks later archive strong provider", func(t *testing.T) {
+		in := inputFile{Items: []linkItem{
+			{Object: &inputObject{
+				Name:        "start",
+				Text:        ByteSlice{0, 0, 0, 0},
+				Relocations: []inputReloc{{Section: "text", Offset: 0, Type: "ABS32", Symbol: "W"}},
+			}},
+			{Archive: &inputArchive{Name: "weak.a", Members: []inputObject{
+				{Name: "weak.o", Text: ByteSlice{1}, Symbols: []inputSymbol{{Name: "W", Binding: "weak", Section: "text", Value: 0}}},
+			}}},
+			{Archive: &inputArchive{Name: "strong.a", Members: []inputObject{
+				{Name: "strong.o", Text: ByteSlice{2}, Symbols: []inputSymbol{{Name: "W", Binding: "strong", Section: "text", Value: 0}}},
+			}}},
+		}}
+		image, report, err := link(marshalInput(t, in))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := []byte{4, 0x10, 0, 0, 1}; !bytes.Equal(image, want) {
+			t.Fatalf("image = %x, want %x", image, want)
+		}
+		if addr := int(report.SymbolAddrs.Global["W"]); addr != 0x1004 {
+			t.Fatalf("W = 0x%x, want weak provider 0x1004", addr)
+		}
+		if len(report.Extracted) != 1 || report.Extracted[0].Archive != "weak.a" {
+			t.Fatalf("extracted = %+v", report.Extracted)
+		}
+	})
+
+	t.Run("strong member pulled for another reference overrides selected weak", func(t *testing.T) {
+		in := inputFile{Items: []linkItem{
+			{Object: &inputObject{
+				Name: "start",
+				Text: ByteSlice{0, 0, 0, 0, 0, 0, 0, 0},
+				Relocations: []inputReloc{
+					{Section: "text", Offset: 0, Type: "ABS32", Symbol: "W"},
+					{Section: "text", Offset: 4, Type: "ABS32", Symbol: "X"},
+				},
+			}},
+			{Archive: &inputArchive{Name: "weak.a", Members: []inputObject{
+				{Name: "weak.o", Text: ByteSlice{1}, Symbols: []inputSymbol{{Name: "W", Binding: "weak", Section: "text", Value: 0}}},
+			}}},
+			{Archive: &inputArchive{Name: "both.a", Members: []inputObject{
+				{Name: "both.o", Text: ByteSlice{2}, Symbols: []inputSymbol{
+					{Name: "W", Binding: "strong", Section: "text", Value: 0},
+					{Name: "X", Binding: "strong", Section: "text", Value: 0},
+				}},
+			}}},
+		}}
+		image, report, err := link(marshalInput(t, in))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Both relocations resolve to the strong provider after start and weak.o.
+		if want, _ := hex.DecodeString("09100000091000000102"); !bytes.Equal(image, want) {
+			t.Fatalf("image = %x, want %x", image, want)
+		}
+		if addr := int(report.SymbolAddrs.Global["W"]); addr != 0x1009 {
+			t.Fatalf("W = 0x%x, want strong provider 0x1009", addr)
+		}
+	})
+}
+
+func TestStaticArchiveOrderAndLocalScoping(t *testing.T) {
+	t.Run("archive before reference does not satisfy it", func(t *testing.T) {
+		in := inputFile{Items: []linkItem{
+			{Archive: &inputArchive{Name: "early.a", Members: []inputObject{
+				{Name: "provider.o", Text: ByteSlice{1}, Symbols: []inputSymbol{{Name: "late", Binding: "strong", Section: "text", Value: 0}}},
+			}}},
+			{Object: &inputObject{
+				Name:        "later-reference.o",
+				Text:        ByteSlice{0, 0, 0, 0},
+				Relocations: []inputReloc{{Section: "text", Offset: 0, Type: "ABS32", Symbol: "late"}},
+			}},
+		}}
+		objects, extracted, err := selectArchives(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(objects) != 1 || len(extracted) != 0 {
+			t.Fatalf("objects=%+v extracted=%+v", objects, extracted)
+		}
+		if _, _, err := link(marshalInput(t, in)); err == nil || !strings.Contains(err.Error(), `unresolved symbol "late"`) {
+			t.Fatalf("error = %v, want unresolved late", err)
+		}
+	})
+
+	t.Run("local relocation does not extract a global archive member", func(t *testing.T) {
+		in := inputFile{Items: []linkItem{
+			{Object: &inputObject{
+				Name: "local-owner",
+				Text: ByteSlice{0, 0, 0, 0},
+				Symbols: []inputSymbol{
+					{Name: "G", Binding: "local", Section: "text", Value: 0},
+				},
+				Relocations: []inputReloc{{Section: "text", Offset: 0, Type: "ABS32", Symbol: "G"}},
+			}},
+			{Archive: &inputArchive{Name: "global.a", Members: []inputObject{
+				{Name: "global-owner.o", Text: ByteSlice{1}, Symbols: []inputSymbol{{Name: "G", Binding: "strong", Section: "text", Value: 0}}},
+			}}},
+		}}
+		image, report, err := link(marshalInput(t, in))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := []byte{0, 0x10, 0, 0}; !bytes.Equal(image, want) {
+			t.Fatalf("image = %x, want %x", image, want)
+		}
+		if len(report.Layout) != 1 || len(report.Extracted) != 0 || len(report.SymbolAddrs.Global) != 0 {
+			t.Fatalf("report layout=%v extracted=%v globals=%v", report.Layout, report.Extracted, report.SymbolAddrs.Global)
+		}
+	})
+}
+
+func TestArchiveExtractionCauseUsesSmallestCurrentSymbol(t *testing.T) {
+	in := inputFile{Items: []linkItem{
+		{Object: &inputObject{
+			Name: "start",
+			Text: ByteSlice{0, 0, 0, 0, 0, 0, 0, 0},
+			Relocations: []inputReloc{
+				{Section: "text", Offset: 0, Type: "ABS32", Symbol: "zeta"},
+				{Section: "text", Offset: 4, Type: "ABS32", Symbol: "alpha"},
+			},
+		}},
+		{Archive: &inputArchive{Name: "lib.a", Members: []inputObject{
+			{Name: "both.o", Text: ByteSlice{1}, Symbols: []inputSymbol{
+				{Name: "zeta", Binding: "strong", Section: "text", Value: 0},
+				{Name: "alpha", Binding: "strong", Section: "text", Value: 0},
+			}},
+		}}},
+	}}
+	_, report, err := link(marshalInput(t, in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := report.Extracted; len(got) != 1 || got[0].Cause != "alpha" {
+		t.Fatalf("extracted = %+v, want cause alpha", got)
+	}
+}
+
+func TestItemInterfaceRejectsMixedOrInvalidCommandInput(t *testing.T) {
+	in := inputFile{
+		Objects: []inputObject{{Name: "ordinary.o"}},
+		Items: []linkItem{
+			{Object: &inputObject{Name: "item.o"}},
+		},
+	}
+	if _, _, err := selectArchives(in); err == nil || !strings.Contains(err.Error(), "cannot both be present") {
+		t.Fatalf("error = %v, want mixed input error", err)
+	}
+}
+
+func TestItemInterfaceValidatesStructureAndLimits(t *testing.T) {
+	tests := []struct {
+		name string
+		in   inputFile
+		want string
+	}{
+		{
+			name: "empty item",
+			in:   inputFile{Items: []linkItem{{}}},
+			want: "exactly one object or archive",
+		},
+		{
+			name: "object and archive in one item",
+			in: inputFile{Items: []linkItem{{
+				Object:  &inputObject{Name: "object.o"},
+				Archive: &inputArchive{Name: "archive.a"},
+			}}},
+			want: "exactly one object or archive",
+		},
+		{
+			name: "empty archive name",
+			in: inputFile{Items: []linkItem{{
+				Archive: &inputArchive{},
+			}}},
+			want: "empty name",
+		},
+		{
+			name: "duplicate archive names",
+			in: inputFile{Items: []linkItem{
+				{Archive: &inputArchive{Name: "lib.a"}},
+				{Archive: &inputArchive{Name: "lib.a"}},
+			}},
+			want: "duplicated",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, err := selectArchives(tt.in); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want substring %q", err, tt.want)
+			}
+		})
+	}
+
+	t.Run("archive count limit", func(t *testing.T) {
+		in := inputFile{}
+		for i := 0; i < maxArchives+1; i++ {
+			in.Items = append(in.Items, linkItem{Archive: &inputArchive{Name: fmt.Sprintf("lib%d.a", i)}})
+		}
+		_, _, err := selectArchives(in)
+		if err == nil || !strings.Contains(err.Error(), "too many archives") {
+			t.Fatalf("error = %v, want archive limit error", err)
+		}
+	})
 }
 
 func TestLocalSymbolShadowsGlobal(t *testing.T) {
